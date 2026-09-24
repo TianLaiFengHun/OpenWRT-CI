@@ -2,7 +2,7 @@ config limit 'global'
 	option enabled '1'
 
 # ECM/NSS 硬件加速自动跳过（限速设备自动卸载 offload）
-config ecm_exclude 'global'
+config ecm_exclude 'ecm'
 	option enabled '1'
 	# 打给限速设备流量的 fwmark / ctmark 值（ECM mark classifier 识别后拒绝硬件加速）
 	option mark '0x10'

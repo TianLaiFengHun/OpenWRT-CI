@@ -13,7 +13,7 @@ MARK_MASK="0x10"
 start() {
 	enable_mark_classifier
 	generate_nft
-	generate_ecm_exclude
+	generate_ecm
 	reload_fw4
 }
 
@@ -130,19 +130,19 @@ probe_ecm_classifier() {
 	fi
 }
 
-# 为限速设备生成 fwmark/ctmark 跳过规则（/etc/config/connlimit 的 ecm_exclude 段）
-generate_ecm_exclude() {
+# 为限速设备生成 fwmark/ctmark 跳过规则（/etc/config/connlimit 的 ecm 段）
+generate_ecm() {
 	local enabled=1
 
 	config_load connlimit
-	config_get_bool enabled ecm_exclude enabled 1
+	config_get_bool enabled ecm enabled 1
 	[ "$enabled" = "1" ] || {
 		rm -f "$ECM_NFT_FILE"
 		return 0
 	}
 
-	config_get MARK ecm_exclude mark 0x10
-	config_get MARK_MASK ecm_exclude mark_mask 0x10
+	config_get MARK ecm mark 0x10
+	config_get MARK_MASK ecm mark_mask 0x10
 
 	probe_ecm_classifier
 

@@ -20,7 +20,11 @@ pick:value("", translate("-- 请选择 --"))
 
 local function load_neighbors()
 	local list = {}
-	local ok, nb = pcall(luci.sys.net.neighbors)
+	local ok, nb = false, nil
+	local net = type(luci) == "table" and luci.sys and luci.sys.net
+	if type(net) == "table" and type(net.neighbors) == "function" then
+		ok, nb = pcall(net.neighbors)
+	end
 	if ok and type(nb) == "table" then
 		for _, e in ipairs(nb) do
 			if e.ip and e.mac and e.mac ~= "00:00:00:00:00:00" then

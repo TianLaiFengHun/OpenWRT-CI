@@ -71,11 +71,44 @@ if [ -f "$TS_FILE" ]; then
 	fi
 fi
 
-#修改 UPnP IGD 菜单位置到"网络"
+#修改 eqosplus 菜单位置到"网络"，并置于防火墙（firewall order=60）之后（order=61）
+EQOSPLUS_CTRL=$(find ./ ../feeds/ -path "*/luci-app-eqosplus/luasrc/controller/eqosplus.lua" 2>/dev/null | head -n 1)
+if [ -n "$EQOSPLUS_CTRL" ]; then
+	if sed -i \
+		-e 's/entry({"admin", "control", "eqosplus"}, cbi("eqosplus"), _("Eqosplus"), 10)/entry({"admin", "network", "eqosplus"}, cbi("eqosplus"), _("Eqosplus"), 61)/' \
+		-e 's/entry({"admin", "control", "eqosplus", "status"}, call("act_status"))/entry({"admin", "network", "eqosplus", "status"}, call("act_status"))/' \
+		"$EQOSPLUS_CTRL"; then
+		echo "eqosplus menu moved to network (after firewall, order 61)"
+	else
+		echo "eqosplus menu fix failed; continuing!"
+	fi
+fi
+
+#修改 UPnP IGD 菜单位置到"网络"，并置于 DHCP 之后（dhcp order=40，upnp order=41）
 UPNP_MENU=$(find ./ ../feeds/ -path "*/luci-app-upnp/root/usr/share/luci/menu.d/luci-app-upnp.json" 2>/dev/null | head -n 1)
 if [ -n "$UPNP_MENU" ]; then
 	sed -i 's#"admin/services/upnp#"admin/network/upnp#g' "$UPNP_MENU"
-	echo "upnp menu moved to network"
+	if python3 - "$UPNP_MENU" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+new = {}
+for k, v in data.items():
+    nk = k.replace("admin/services/upnp", "admin/network/upnp", 1)
+    if nk == "admin/network/upnp" and isinstance(v, dict) and "order" not in v:
+        v = dict(v)
+        v["order"] = 41
+    new[nk] = v
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(new, f, indent="\t", ensure_ascii=False)
+    f.write("\n")
+PYEOF
+	then
+		echo "upnp menu moved to network (after dhcp, order 41)"
+	else
+		echo "upnp menu fix failed; continuing!"
+	fi
 fi
 
 #删除系统菜单下的"插件"项

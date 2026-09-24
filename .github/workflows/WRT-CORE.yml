@@ -120,6 +120,7 @@ jobs:
           git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/
 
           git clone https://github.com/zzsj0928/luci-app-pushbot ./wrt/package/luci-app-pushbot
+          git -C ./wrt/package/luci-app-pushbot checkout luci-app-pushbot-v5.18-r19
 
           cd ./wrt/
           WRT_HASH=$(git rev-parse HEAD)
