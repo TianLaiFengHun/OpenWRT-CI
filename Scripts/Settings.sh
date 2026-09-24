@@ -62,3 +62,10 @@ if [[ "${WRT_TARGET^^}" == *"QUALCOMMAX"* ]]; then
 		echo "qualcommax set up nowifi successfully!"
 	fi
 fi
+
+#限制 /tmp tmpfs 为 64M（512M RAM 设备节省内存）
+RC_LOCAL="./package/base-files/files/etc/rc.local"
+if [ -f "$RC_LOCAL" ]; then
+	sed -i "/exit 0/i mount -o remount,size=64M /tmp" "$RC_LOCAL"
+	echo "tmp tmpfs limited to 64M!"
+fi

@@ -8,8 +8,8 @@ CONFIG_PACKAGE_jq=y
 CONFIG_PACKAGE_sqm-scripts-nss=n
 CONFIG_PACKAGE_luci-app-sqm=n
 CONFIG_PACKAGE_kmod-qca-nss-drv-qdisc=n
-CONFIG_PACKAGE_luci-app-eqosplus=y
 # eqosplus 依赖（tc 限速所需）
+CONFIG_PACKAGE_luci-app-eqosplus=y
 CONFIG_PACKAGE_tc=y
 CONFIG_PACKAGE_kmod-ifb=y
 CONFIG_PACKAGE_kmod-act-mirred=y
@@ -49,7 +49,7 @@ CONFIG_PACKAGE_luci-app-openclash=n
 # 页面终端
 CONFIG_PACKAGE_luci-app-ttyd=y
 # 基础依赖-加速相关
-CONFIG_PACKAGE_kmod-nft-offload=n
+CONFIG_PACKAGE_kmod-nft-offload=y
 CONFIG_PACKAGE_kmod-tcp-bpf=y
 CONFIG_PACKAGE_kmod-tcp-bbr=y
 CONFIG_PACKAGE_nft-fullcone=y
@@ -71,8 +71,8 @@ CONFIG_PACKAGE_luci-app-homeproxy=n
 CONFIG_PACKAGE_luci-app-autoreboot=y
 CONFIG_PACKAGE_luci-app-gecoosac=n
 CONFIG_PACKAGE_luci-app-mini-diskmanager=n
-CONFIG_PACKAGE_luci-app-natmapt=y
-CONFIG_PACKAGE_luci-app-partexp=y
+CONFIG_PACKAGE_luci-app-natmapt=n
+CONFIG_PACKAGE_luci-app-partexp=n
 CONFIG_PACKAGE_luci-app-samba4=n
 #删除插件
 CONFIG_PACKAGE_luci-app-attendedsysupgrade=n
@@ -93,6 +93,7 @@ CONFIG_PACKAGE_kmod-nf-nat6=y
 CONFIG_PACKAGE_kmod-nft-arp=y
 CONFIG_PACKAGE_kmod-nft-bridge=y
 CONFIG_PACKAGE_kmod-nft-connlimit=y
+CONFIG_PACKAGE_luci-app-connlimit=y
 CONFIG_PACKAGE_kmod-nft-core=y
 CONFIG_PACKAGE_kmod-nft-dup-inet=y
 CONFIG_PACKAGE_kmod-nft-fib=y
@@ -103,6 +104,8 @@ CONFIG_PACKAGE_kmod-nft-socket=y
 CONFIG_PACKAGE_kmod-nft-tproxy=y
 CONFIG_PACKAGE_kmod-nft-xfrm=y
 CONFIG_PACKAGE_kmod-tun=y
+#zram 压缩缓存（512M RAM 内存扩容，自动带 kmod-zram）
+CONFIG_PACKAGE_zram-swap=y
 #组件调整
 CONFIG_PACKAGE_autocore=y
 CONFIG_PACKAGE_blkid=y
@@ -111,7 +114,7 @@ CONFIG_PACKAGE_cpufreq=y
 CONFIG_PACKAGE_curl=y
 CONFIG_PACKAGE_dmesg=y
 CONFIG_PACKAGE_fdisk=y
-CONFIG_PACKAGE_fullconenat-sonic=y
+CONFIG_PACKAGE_fullconenat-sonic=n
 CONFIG_PACKAGE_htop=y
 CONFIG_PACKAGE_iperf3=y
 CONFIG_PACKAGE_ip-full=y
