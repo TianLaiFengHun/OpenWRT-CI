@@ -44,3 +44,51 @@ FIX "mini-diskmanager" "$PACKAGE_PATH/luci-app-mini-diskmanager" sed -i "s/servi
 #修改natmapt菜单位置
 FIX "natmapt" "$PACKAGE_PATH/luci-app-natmapt" sed -i "s/network/services/g" \
 	"$PACKAGE_PATH/luci-app-natmapt/root/usr/share/luci/menu.d/luci-app-natmap.json"
+
+#修改 UPnP IGD 菜单位置到"网络"，并置于 DHCP 之后（dhcp order=40，upnp order=41）
+UPNP_MENU=$(find ./ ../feeds/ -path "*/luci-app-upnp/root/usr/share/luci/menu.d/luci-app-upnp.json" 2>/dev/null | head -n 1)
+if [ -n "$UPNP_MENU" ]; then
+	sed -i 's#"admin/services/upnp#"admin/network/upnp#g' "$UPNP_MENU"
+	if python3 - "$UPNP_MENU" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+new = {}
+for k, v in data.items():
+    nk = k.replace("admin/services/upnp", "admin/network/upnp", 1)
+    if nk == "admin/network/upnp" and isinstance(v, dict) and "order" not in v:
+        v = dict(v)
+        v["order"] = 41
+    new[nk] = v
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(new, f, indent="\t", ensure_ascii=False)
+    f.write("\n")
+PYEOF
+	then
+		echo "upnp menu moved to network (after dhcp, order 41)"
+	else
+		echo "upnp menu fix failed; continuing!"
+	fi
+fi
+
+#删除系统菜单下的"插件"项
+SYS_MENU=$(find ./ ../feeds/ -path "*/luci-mod-system/root/usr/share/luci/menu.d/luci-mod-system.json" 2>/dev/null | head -n 1)
+if [ -n "$SYS_MENU" ]; then
+	sed -i '/"admin\/system\/plugins": {/,/^\t},$/d' "$SYS_MENU"
+	echo "system plugins menu removed"
+fi
+
+#修改"超级网络唤醒(WOL Ultra)"菜单位置：Control -> 服务
+FIX "wolultra-menu" "$PACKAGE_PATH/packages/luci-app-wolultra" sed -i \
+	's#"admin/control/wolultra"#"admin/services/wolultra"#' \
+	"$PACKAGE_PATH/packages/luci-app-wolultra/root/usr/share/luci/menu.d/luci-app-wolultra.json"
+
+#修改"DDNS-GO"菜单位置：服务 -> VPN
+DDNSGO_MENU=$(find ./ ../feeds/ -path "*/luci-app-ddns-go/root/usr/share/luci/menu.d/luci-app-ddns-go.json" 2>/dev/null | head -n 1)
+if [ -n "$DDNSGO_MENU" ]; then
+	sed -i 's#admin/services/ddns-go#admin/vpn/ddns-go#g' "$DDNSGO_MENU"
+	echo "ddns-go menu moved to vpn"
+else
+	echo "ddns-go menu not found; skipping!"
+fi
