@@ -64,7 +64,11 @@ UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
 
 UPDATE_PACKAGE "diskmanager" "4IceG/luci-app-mini-diskmanager" "main"
 UPDATE_PACKAGE "easytier" "EasyTier/luci-app-easytier" "main"
-UPDATE_PACKAGE "pushbot" "zzsj0928/luci-app-pushbot" "luci-app-pushbot - 5.10-r15"
+# pushbot：自动选取上游最新 tag（形如 luci-app-pushbot-v6.01-r17），取不到则回退默认分支 master
+PUSHBOT_TAG=$(git ls-remote --tags --refs https://github.com/zzsj0928/luci-app-pushbot.git 2>/dev/null | awk -F'refs/tags/' '{print $2}' | sort -V | tail -1)
+[ -z "$PUSHBOT_TAG" ] && PUSHBOT_TAG="master"
+echo "pushbot 使用版本: $PUSHBOT_TAG"
+UPDATE_PACKAGE "pushbot" "zzsj0928/luci-app-pushbot" "$PUSHBOT_TAG"
 UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac miniupnpd sing-box luci-app-homeproxy luci-app-timewol luci-app-upnp luci-app-wolplus luci-app-wolultra"
 
