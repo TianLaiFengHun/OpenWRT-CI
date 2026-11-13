@@ -4,9 +4,10 @@
 name: Auto-Clean
 
 on:
-  #自动清理：每天早上5点
+  #自动清理：每月1日北京时间 02:00
+  #cron 为 UTC，上月最后一天 18:00 = 北京时间当月1日 02:00，故用 28-31 触发再由北京日期门控
   schedule:
-    - cron: 21 21 * * *
+    - cron: 0 18 28-31 * *
   #手动清理
   workflow_dispatch:
 
@@ -16,7 +17,19 @@ jobs:
   auto_clean:
     runs-on: ubuntu-latest
     steps:
+      - name: Check Beijing date
+        id: gate
+        if: github.event_name == 'schedule'
+        run: |
+          today=$(TZ=Asia/Shanghai date +%d)
+          echo "Beijing date: $today"
+          if [ "$today" = "01" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Delete old Releases and Workflows
+        if: github.event_name != 'schedule' || steps.gate.outputs.run == 'true'
         uses: ophub/delete-releases-workflows@main
         with:
           gh_token: ${{secrets.GITHUB_TOKEN}}
