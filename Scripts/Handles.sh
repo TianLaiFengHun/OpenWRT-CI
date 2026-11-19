@@ -92,3 +92,45 @@ if [ -n "$DDNSGO_MENU" ]; then
 else
 	echo "ddns-go menu not found; skipping!"
 fi
+
+#锁定 lucky 核心为 3.8.1(标准版)，并改为使用仓库内置离线包，不走 GitHub release 下载
+LUCKY_MK=$(find ./ ../feeds/ -path "*/lucky/lucky/Makefile" 2>/dev/null | head -n 1)
+if [ -n "$LUCKY_MK" ]; then
+	python3 - "$LUCKY_MK" <<'PYEOF'
+import re, sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8", newline="") as f:
+    s = f.read()
+
+nl = "\r\n" if "\r\n" in s else "\n"
+
+
+def setvar(text, name, val):
+    return re.sub(r"(?m)^" + re.escape(name) + r":=.*?(?=\r?\n|$)", name + ":=" + val, text, count=1)
+
+
+s = setvar(s, "PKG_VERSION", "3.8.1")
+s = setvar(s, "PKG_SOURCE", "")
+s = setvar(s, "PKG_SOURCE_URL", "")
+s = setvar(s, "PKG_HASH", "skip")
+
+block = nl.join([
+    "define Build/Prepare",
+    "\tgzip -dc $(TOPDIR)/Scripts/lucky/lucky_$(PKG_VERSION)_Linux_$(LUCKY_ARCH).tar.gz | $(HOST_TAR) -C $(PKG_BUILD_DIR) -xf -",
+    "\t$(Build/Patch)",
+    "endef",
+])
+if re.search(r"(?s)define Build/Prepare.*?\nendef", s):
+    s = re.sub(r"(?s)define Build/Prepare.*?\nendef", block, s, count=1)
+else:
+    s = s.replace("include $(INCLUDE_DIR)/package.mk", block + nl + nl + "include $(INCLUDE_DIR)/package.mk", 1)
+
+with open(path, "w", encoding="utf-8", newline="") as f:
+    f.write(s)
+
+print("lucky: PKG_VERSION=3.8.1, source -> Scripts/lucky local tarball")
+PYEOF
+else
+	echo "lucky Makefile not found; skipping!"
+fi
