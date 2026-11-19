@@ -134,3 +134,15 @@ PYEOF
 else
 	echo "lucky Makefile not found; skipping!"
 fi
+
+#修改"Lucky"菜单位置：服务 -> VPN 的首项（DDNS-GO order 58，故取 10）
+LUCKY_MENU=$(find ./ ../feeds/ -path "*/luci-app-lucky/root/usr/share/luci/menu.d/luci-app-lucky.json" 2>/dev/null | head -n 1)
+if [ -n "$LUCKY_MENU" ]; then
+	sed -i \
+		-e 's#"admin/services/lucky"#"admin/vpn/lucky"#' \
+		-e 's#"order": 60#"order": 10#' \
+		"$LUCKY_MENU"
+	echo "lucky menu moved to vpn (first item)"
+else
+	echo "lucky menu not found; skipping!"
+fi
