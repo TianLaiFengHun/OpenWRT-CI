@@ -98,14 +98,14 @@ fi
 TS_PKG_DIR="./package/luci-app-tailscale"
 
 if [ -d "$TS_PKG_DIR/root" ]; then
-	# ---- 1. 替换 init 脚本：单实例 tailscaled + 清理 netifd 残留接口 + 异步同步 UI 选项 ----
+	# ---- 1. 替换 init 脚本：单实例 tailscaled + 保留 tailscale0 在「网络-接口」的显示 + 异步同步 UI 选项 ----
 	mkdir -p "$TS_PKG_DIR/root/etc/init.d"
 	cat > "$TS_PKG_DIR/root/etc/init.d/tailscale" <<'TS_INIT_EOF'
 #!/bin/sh /etc/rc.common
 
 # Tailscale service（构建侧修复版）
 # 1) 只启动一个 tailscaled 实例，不再起 tailscale_helper，避免 procd crash loop
-# 2) 启动前清理 netifd 中残留的 network.tailscale，避免 netifd 与 tailscaled 争抢 tailscale0
+# 2) 保留官方形态的 network.tailscale 段（proto=none + device=tailscale0），让 tailscale0 正常显示在「网络-接口」，但不携带地址，避免 netifd 与 tailscaled 争抢 tailscale0
 # 3) UI 选项通过 `tailscale set` 异步下发（该子命令不会触发登录）
 
 START=90
@@ -116,27 +116,38 @@ PROGD=/usr/sbin/tailscaled
 TSCLI=/usr/sbin/tailscale
 SOCK=/var/run/tailscale/tailscaled.sock
 
-sanitize_netifd() {
-	local s proto dev changed=0
+# 让 tailscale0 按官方形态出现在「网络 - 接口」：
+# 保留一个 network.tailscale 段（proto=none + device=tailscale0），netifd 只托管展示、不配任何地址，
+# 因此既不会从列表里消失，也不会与 tailscaled 争抢同一张网卡（地址闪断的真正根因是地址字段，不是段本身）。
+ensure_netifd_interface() {
+	local s o changed=0
 
-	# 1) 删除所有把 tailscale0 交给 netifd 托管的接口段（与 tailscaled 抢地址的直接来源）
+	# 1) 清掉除 network.tailscale 之外、同样指向 tailscale0 的重复段
 	for s in $(uci -q show network 2>/dev/null | grep -E "\.(device|ifname)='tailscale0'" | cut -d. -f2 | sort -u); do
+		[ "$s" = "tailscale" ] && continue
 		uci -q delete network."$s"
 		changed=1
-		echo "tailscale: removed netifd interface network.$s (device=tailscale0)"
+		echo "tailscale: removed duplicate netifd section network.$s (device=tailscale0)"
 	done
 
-	# 2) 删除既无设备又携带地址的残留 network.tailscale（典型错误：proto=static + ipaddr=100.66.6.1/8）
-	proto=$(uci -q get network.tailscale.proto)
-	dev=$(uci -q get network.tailscale.ifname)
-	[ -n "$dev" ] || dev=$(uci -q get network.tailscale.device)
-	if [ -z "$dev" ] && [ -n "$(uci -q get network.tailscale.ipaddr)" ]; then
-		uci -q delete network.tailscale
-		changed=1
-		echo "tailscale: removed stale netifd section network.tailscale (proto=$proto)"
-	fi
+	# 2) 确保 tailscale 接口段存在，且固定为 proto=none + device=tailscale0
+	[ "$(uci -q get network.tailscale)" = "interface" ] || { uci -q set network.tailscale='interface'; changed=1; }
+	[ "$(uci -q get network.tailscale.proto)" = "none" ] || { uci -q set network.tailscale.proto='none'; changed=1; }
+	[ "$(uci -q get network.tailscale.device)" = "tailscale0" ] || { uci -q set network.tailscale.device='tailscale0'; changed=1; }
 
-	[ "$changed" = "1" ] && uci commit network
+	# 3) 删掉会让 netifd 参与配地址/路由的字段（这些字段才是把 tailscale0 变成"抢地址接口"的原因）
+	for o in ifname ipaddr netmask ip6addr ip6prefix ip6assign gateway ip6gw dns broadcast; do
+		[ -n "$(uci -q get network.tailscale.$o)" ] && { uci -q delete network.tailscale."$o"; changed=1; }
+	done
+
+	[ "$changed" = "1" ] || return 0
+
+	uci commit network
+	# 新写入的段要等 netifd 重新加载后才会出现在「网络-接口」；期间用标记文件挡住 hotplug 递归
+	touch /tmp/.tailscale_netifd_busy
+	/etc/init.d/network reload >/dev/null 2>&1
+	( sleep 5; rm -f /tmp/.tailscale_netifd_busy ) &
+	echo "tailscale: netifd section network.tailscale normalized (proto=none, device=tailscale0)"
 	return 0
 }
 
@@ -167,7 +178,7 @@ start_instance() {
 	# 纯 nftables 固件：不引入 iptables 兼容层，防火墙模式一律 nftables
 	fw_mode=nftables
 
-	sanitize_netifd
+	ensure_netifd_interface
 
 	/usr/sbin/tailscaled --cleanup >/dev/null 2>&1
 
@@ -256,6 +267,8 @@ TS_INIT_EOF
 # 2) 不限定接口名，避免 WAN 被改成 pppoe-wan 等名称后服务永不启动
 
 [ "$ACTION" = "ifup" ] || exit 0
+# init 正在规范化 network.tailscale 段并 reload netifd 时不要响应，避免 start→reload→start 递归
+[ -f /tmp/.tailscale_netifd_busy ] && exit 0
 [ "$(uci -q get tailscale.settings.enabled)" = "1" ] || exit 0
 pgrep -f /usr/sbin/tailscaled >/dev/null 2>&1 && exit 0
 /etc/init.d/tailscale start >/tmp/tailscale.log 2>&1 &
