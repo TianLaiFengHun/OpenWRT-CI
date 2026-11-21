@@ -85,6 +85,250 @@ if [ -f ./feeds/packages/net/tailscale/Makefile ]; then
 	sed -i '/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d;' ./feeds/packages/net/tailscale/Makefile
 fi
 
+# ======================================================================================
+# tailscale 运行时修复：直接改写克隆下来的 luci-app-tailscale 包内容（随包安装，无需 files/ 覆盖层）
+#   问题1 接口地址闪断：上游 init 同时起两个 procd 实例（tailscaled 与 tailscale_helper），
+#         helper 退出码 1 触发 procd crash loop，接口反复 down/up；同时 netifd 里残留
+#         proto=static、ipaddr=100.66.6.1/8 的 network.tailscale，与 tailscaled 争抢 tailscale0 地址
+#   问题1b hotplug 循环：上游 hotplug 在任意接口 ifup/ifupdate 都执行 start，
+#         而 tailscaled 拉起 tailscale0 本身也会产生 ifup 事件，形成 start→up→start 自激重启
+#   问题2 日志 ACL：上游 ACL 只授权 /sbin/logread，而 logread 实际位于 /usr/sbin，
+#         LuCI 日志页 exec 被 rpcd 拒绝：PermissionError: Access to command denied by ACL
+# ======================================================================================
+TS_PKG_DIR="./package/luci-app-tailscale"
+
+if [ -d "$TS_PKG_DIR/root" ]; then
+	# ---- 1. 替换 init 脚本：单实例 tailscaled + 清理 netifd 残留接口 + 异步同步 UI 选项 ----
+	mkdir -p "$TS_PKG_DIR/root/etc/init.d"
+	cat > "$TS_PKG_DIR/root/etc/init.d/tailscale" <<'TS_INIT_EOF'
+#!/bin/sh /etc/rc.common
+
+# Tailscale service（构建侧修复版）
+# 1) 只启动一个 tailscaled 实例，不再起 tailscale_helper，避免 procd crash loop
+# 2) 启动前清理 netifd 中残留的 network.tailscale，避免 netifd 与 tailscaled 争抢 tailscale0
+# 3) UI 选项通过 `tailscale set` 异步下发（该子命令不会触发登录）
+
+START=90
+STOP=10
+USE_PROCD=1
+
+PROGD=/usr/sbin/tailscaled
+TSCLI=/usr/sbin/tailscale
+SOCK=/var/run/tailscale/tailscaled.sock
+
+sanitize_netifd() {
+	local s proto dev changed=0
+
+	# 1) 删除所有把 tailscale0 交给 netifd 托管的接口段（与 tailscaled 抢地址的直接来源）
+	for s in $(uci -q show network 2>/dev/null | grep -E "\.(device|ifname)='tailscale0'" | cut -d. -f2 | sort -u); do
+		uci -q delete network."$s"
+		changed=1
+		echo "tailscale: removed netifd interface network.$s (device=tailscale0)"
+	done
+
+	# 2) 删除既无设备又携带地址的残留 network.tailscale（典型错误：proto=static + ipaddr=100.66.6.1/8）
+	proto=$(uci -q get network.tailscale.proto)
+	dev=$(uci -q get network.tailscale.ifname)
+	[ -n "$dev" ] || dev=$(uci -q get network.tailscale.device)
+	if [ -z "$dev" ] && [ -n "$(uci -q get network.tailscale.ipaddr)" ]; then
+		uci -q delete network.tailscale
+		changed=1
+		echo "tailscale: removed stale netifd section network.tailscale (proto=$proto)"
+	fi
+
+	[ "$changed" = "1" ] && uci commit network
+	return 0
+}
+
+start_service() {
+	config_load tailscale
+	config_foreach start_instance tailscale
+}
+
+start_instance() {
+	local cfg="$1"
+	local enabled port config_path fw_mode log_stdout log_stderr
+
+	config_get_bool enabled "$cfg" 'enabled' 0
+	if [ "$enabled" != "1" ]; then
+		echo "tailscale: disabled in /etc/config/tailscale"
+		return 0
+	fi
+
+	config_get port "$cfg" 'port' 41641
+	config_get config_path "$cfg" 'config_path' /etc/tailscale
+	config_get_bool log_stdout "$cfg" 'log_stdout' 1
+	config_get_bool log_stderr "$cfg" 'log_stderr' 1
+
+	[ -n "$config_path" ] || config_path=/etc/tailscale
+	mkdir -p "$config_path"
+	mkdir -p /var/run/tailscale
+
+	# 纯 nftables 固件：不引入 iptables 兼容层，防火墙模式一律 nftables
+	fw_mode=nftables
+
+	sanitize_netifd
+
+	/usr/sbin/tailscaled --cleanup >/dev/null 2>&1
+
+	procd_open_instance
+	procd_set_param command "$PROGD"
+	procd_append_param command --port "$port"
+	procd_append_param command --state "$config_path/tailscaled.state"
+	procd_set_param env TS_DEBUG_FIREWALL_MODE="$fw_mode"
+	procd_append_param env TS_NO_LOGS_NO_SUPPORT=true
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout "$log_stdout"
+	procd_set_param stderr "$log_stderr"
+	procd_close_instance
+
+	apply_settings "$cfg" &
+}
+
+apply_settings() {
+	local cfg="$1"
+	local accept_routes accept_dns advertise_exit_node exit_node
+	local advertise_routes disable_snat authkey login_server flags hostname
+	local args="" i=0
+
+	config_get accept_routes "$cfg" 'accept_routes' 1
+	config_get accept_dns "$cfg" 'accept_dns' 1
+	config_get advertise_exit_node "$cfg" 'advertise_exit_node' 0
+	config_get exit_node "$cfg" 'exit_node'
+	config_get advertise_routes "$cfg" 'advertise_routes'
+	config_get disable_snat "$cfg" 'disable_snat_subnet_routes' 0
+	config_get authkey "$cfg" 'authkey'
+	config_get login_server "$cfg" 'login_server'
+	config_get flags "$cfg" 'flags'
+	config_get hostname "$cfg" 'hostname'
+
+	[ "$accept_routes" = "1" ] && args="$args --accept-routes=true" || args="$args --accept-routes=false"
+	[ "$accept_dns" = "0" ] && args="$args --accept-dns=false" || args="$args --accept-dns=true"
+	[ "$advertise_exit_node" = "1" ] && args="$args --advertise-exit-node=true" || args="$args --advertise-exit-node=false"
+	[ -n "$exit_node" ] && args="$args --exit-node=$exit_node --exit-node-allow-lan-access=true" || args="$args --exit-node="
+	[ -n "$advertise_routes" ] && args="$args --advertise-routes=$(echo "$advertise_routes" | tr ' ' ',')"
+	[ -n "$hostname" ] && args="$args --hostname=$hostname"
+	[ "$disable_snat" = "1" ] && args="$args --snat-subnet-routes=false" || args="$args --snat-subnet-routes=true"
+
+	while [ $i -lt 30 ]; do
+		[ -S "$SOCK" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if [ ! -S "$SOCK" ]; then
+		echo "tailscale: socket $SOCK not ready, skip applying settings"
+		return 0
+	fi
+
+	$TSCLI set $args >/dev/null 2>&1
+	[ -n "$login_server" ] && flags="$flags --login-server=$login_server"
+	[ -n "$authkey" ] && $TSCLI up --authkey="$authkey" $args $flags >/dev/null 2>&1
+	return 0
+}
+
+stop_service() {
+	[ -x /usr/sbin/tailscaled ] && /usr/sbin/tailscaled --cleanup >/dev/null 2>&1
+	return 0
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "tailscale"
+}
+TS_INIT_EOF
+	chmod 0755 "$TS_PKG_DIR/root/etc/init.d/tailscale"
+	echo "tailscale: init script replaced"
+
+	# ---- 1.1 替换 hotplug 脚本：原版在任意接口 ifup/ifupdate 时都执行 start，
+	#          与 tailscaled 自己拉起 tailscale0 的事件互相触发，形成 start->up->start 循环 ----
+	mkdir -p "$TS_PKG_DIR/root/etc/hotplug.d/iface"
+	cat > "$TS_PKG_DIR/root/etc/hotplug.d/iface/40-tailscale" <<'TS_HOTPLUG_EOF'
+#!/bin/sh
+
+# 接口上线时确保 tailscaled 在跑：
+# 1) 进程已在运行则直接退出——tailscaled 拉起 tailscale0 本身也会产生 ifup 事件，
+#    原版无条件 start 会形成 start→up→start 自激重启并导致 IPv4 闪断
+# 2) 不限定接口名，避免 WAN 被改成 pppoe-wan 等名称后服务永不启动
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$(uci -q get tailscale.settings.enabled)" = "1" ] || exit 0
+pgrep -f /usr/sbin/tailscaled >/dev/null 2>&1 && exit 0
+/etc/init.d/tailscale start >/tmp/tailscale.log 2>&1 &
+TS_HOTPLUG_EOF
+	chmod 0755 "$TS_PKG_DIR/root/etc/hotplug.d/iface/40-tailscale"
+	echo "tailscale: hotplug script replaced"
+
+	# ---- 2. 重写 ACL：补齐 logread 双路径与 tailscale 子命令，修复日志页 ACL 拒绝 ----
+	mkdir -p "$TS_PKG_DIR/root/usr/share/rpcd/acl.d"
+	cat > "$TS_PKG_DIR/root/usr/share/rpcd/acl.d/luci-app-tailscale.json" <<'TS_ACL_EOF'
+{
+	"luci-app-tailscale": {
+		"description": "Grant access to Tailscale configuration",
+		"read": {
+			"file": {
+				"/sbin/logread": [ "exec" ],
+				"/usr/sbin/logread": [ "exec" ],
+				"/sbin/logread -e tailscale": [ "exec" ],
+				"/usr/sbin/logread -e tailscale": [ "exec" ],
+				"/usr/bin/logread -e tailscale": [ "exec" ],
+				"/sbin/ip -s -j ad": [ "exec" ],
+				"/usr/sbin/ip -s -j ad": [ "exec" ],
+				"/usr/sbin/tailscale status --json": [ "exec" ],
+				"/usr/bin/tailscale status --json": [ "exec" ],
+				"/usr/sbin/tailscale netcheck": [ "exec" ],
+				"/usr/bin/tailscale netcheck": [ "exec" ],
+				"/usr/sbin/tailscale version": [ "exec" ],
+				"/usr/bin/tailscale version": [ "exec" ],
+				"/usr/sbin/tailscale ip": [ "exec" ],
+				"/usr/bin/tailscale ip": [ "exec" ],
+				"/usr/sbin/tailscale login": [ "exec" ],
+				"/usr/bin/tailscale login": [ "exec" ],
+				"/usr/sbin/tailscale logout": [ "exec" ],
+				"/usr/bin/tailscale logout": [ "exec" ]
+			},
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "tailscale" ]
+		},
+		"write": {
+			"file": {
+				"/sbin/logread": [ "exec" ],
+				"/usr/sbin/logread": [ "exec" ],
+				"/sbin/logread -e tailscale": [ "exec" ],
+				"/usr/sbin/logread -e tailscale": [ "exec" ],
+				"/usr/bin/logread -e tailscale": [ "exec" ],
+				"/sbin/ip -s -j ad": [ "exec" ],
+				"/usr/sbin/ip -s -j ad": [ "exec" ],
+				"/usr/sbin/tailscale status --json": [ "exec" ],
+				"/usr/bin/tailscale status --json": [ "exec" ],
+				"/usr/sbin/tailscale login": [ "exec" ],
+				"/usr/bin/tailscale login": [ "exec" ],
+				"/usr/sbin/tailscale logout": [ "exec" ],
+				"/usr/bin/tailscale logout": [ "exec" ],
+				"/usr/sbin/tailscale up": [ "exec" ],
+				"/usr/bin/tailscale up": [ "exec" ],
+				"/usr/sbin/tailscale down": [ "exec" ],
+				"/usr/bin/tailscale down": [ "exec" ],
+				"/usr/sbin/tailscale set": [ "exec" ],
+				"/usr/bin/tailscale set": [ "exec" ]
+			},
+			"uci": [ "tailscale" ]
+		}
+	}
+}
+TS_ACL_EOF
+	chmod 0644 "$TS_PKG_DIR/root/usr/share/rpcd/acl.d/luci-app-tailscale.json"
+	echo "tailscale: ACL rewritten (logread /usr/sbin path granted)"
+else
+	echo "tailscale: luci-app-tailscale package dir not found, skip runtime fix"
+fi
+
 UPDATE_PACKAGE "ddns-go" "sirpdboy/luci-app-ddns-go" "main"
 UPDATE_PACKAGE "lucky" "gdy666/luci-app-lucky" "main"
 UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-speedtest"
