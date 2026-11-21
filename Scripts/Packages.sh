@@ -271,9 +271,11 @@ TS_HOTPLUG_EOF
 		"description": "Grant access to Tailscale configuration",
 		"read": {
 			"file": {
-				"/sbin/logread": [ "exec" ],
-				"/usr/sbin/logread": [ "exec" ],
+				"/sbin/logread": [ "read", "exec" ],
+				"/usr/libexec/logread-ubox": [ "read", "exec" ],
+				"/usr/sbin/logread": [ "read", "exec" ],
 				"/sbin/logread -e tailscale": [ "exec" ],
+				"/usr/libexec/logread-ubox -e tailscale": [ "exec" ],
 				"/usr/sbin/logread -e tailscale": [ "exec" ],
 				"/usr/bin/logread -e tailscale": [ "exec" ],
 				"/sbin/ip -s -j ad": [ "exec" ],
@@ -298,9 +300,11 @@ TS_HOTPLUG_EOF
 		},
 		"write": {
 			"file": {
-				"/sbin/logread": [ "exec" ],
-				"/usr/sbin/logread": [ "exec" ],
+				"/sbin/logread": [ "read", "exec" ],
+				"/usr/libexec/logread-ubox": [ "read", "exec" ],
+				"/usr/sbin/logread": [ "read", "exec" ],
 				"/sbin/logread -e tailscale": [ "exec" ],
+				"/usr/libexec/logread-ubox -e tailscale": [ "exec" ],
 				"/usr/sbin/logread -e tailscale": [ "exec" ],
 				"/usr/bin/logread -e tailscale": [ "exec" ],
 				"/sbin/ip -s -j ad": [ "exec" ],
