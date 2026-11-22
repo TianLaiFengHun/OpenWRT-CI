@@ -148,10 +148,11 @@ else
 fi
 
 # tailscale：单实例 init + hotplug 守卫 + 接口自动建段（改写克隆下来的 luci-app-tailscale 包内容，随包安装）
-#   1) init 只起一个 tailscaled：上游额外起的 tailscale_helper 退出码 1，触发 procd crash loop、IPv4 闪断
+#   1) init 只起一个 tailscaled，不再调用 tailscale_helper（helper 文件由构建脚本直接删除）
 #   2) hotplug 加 pgrep 守卫：tailscaled 拉起 tailscale0 也会 ifup，原版无条件 start 会 start→up→start 自激
 #   3) 启用后自动建 network.tailscale 段（static + 真实 IPv4/IPv6），「网络-接口」显示 tailscale0
-#   4) ACL 只补 logread 真实路径，其余授权保持上游原版
+#   4) 复现 helper 的必需副作用：firewall zone(tszone, network=tailscale)+4 条 forwarding，停止时对称清理（MagicDNS/subnet 路由不迁移）
+#   5) ACL 只补 logread 真实路径，其余授权保持上游原版
 # tailscale 后端自带的 init/config 与 luci-app-tailscale 冲突，移除后端同名文件定义
 TS_BACKEND_MK=$(find ./ ../feeds/ -path "*/net/tailscale/Makefile" 2>/dev/null | head -n 1)
 if [ -n "$TS_BACKEND_MK" ]; then
@@ -163,10 +164,11 @@ fi
 
 # ======================================================================================
 # tailscale 运行时修复：直接改写克隆下来的 luci-app-tailscale 包内容（随包安装，无需 files/ 覆盖层）
-#   1) init 只起一个 tailscaled：上游额外起的 tailscale_helper 退出码 1，触发 procd crash loop、IPv4 闪断
+#   1) init 只起一个 tailscaled，不再调用 tailscale_helper（helper 文件由构建脚本直接删除）
 #   2) hotplug 加 pgrep 守卫：tailscaled 拉起 tailscale0 也会 ifup，原版无条件 start 会 start→up→start 自激
 #   3) 启用后自动建 network.tailscale 段（static + 真实 IPv4/IPv6），「网络-接口」显示 tailscale0
-#   4) ACL 只补 logread 真实路径，其余授权保持上游原版
+#   4) 复现 helper 的必需副作用：firewall zone(tszone, network=tailscale)+4 条 forwarding，停止时对称清理（MagicDNS/subnet 路由不迁移）
+#   5) ACL 只补 logread 真实路径，其余授权保持上游原版
 # ======================================================================================
 TS_PKG_DIR="$PACKAGE_PATH/luci-app-tailscale"
 
@@ -273,9 +275,77 @@ ensure_netifd_iface() {
 	if [ -n "$v6" ]; then
 		[ "$(uci -q get network.tailscale.ip6addr)" = "$v6" ] || { uci -q set network.tailscale.ip6addr="$v6"; changed=1; }
 	fi
-	[ "$changed" = "1" ] || return 0
-	uci -q commit network
-	/etc/init.d/network reload >/dev/null 2>&1 &
+	if [ "$changed" = "1" ]; then
+		uci -q commit network
+		/etc/init.d/network reload >/dev/null 2>&1 &
+	fi
+
+	ensure_extras
+	return 0
+}
+
+# 复现上游 tailscale_helper 的必需副作用（原版由 helper 完成，去掉 helper 后必须自理）
+#   firewall.tszone（network=tailscale）+ 4 条 forwarding，字段与 helper 完全一致
+# 幂等：值无变化不提交、不 reload，避免 30 秒轮询引起防火墙抖动
+ensure_fw_fwd() {
+	local sec="$1" src="$2" dest="$3"
+
+	[ "$(uci -q get firewall.$sec)" = "forwarding" ] || { uci -q set firewall.$sec='forwarding'; fw_changed=1; }
+	[ "$(uci -q get firewall.$sec.src)" = "$src" ] || { uci -q set firewall.$sec.src="$src"; fw_changed=1; }
+	[ "$(uci -q get firewall.$sec.dest)" = "$dest" ] || { uci -q set firewall.$sec.dest="$dest"; fw_changed=1; }
+}
+
+ensure_extras() {
+	local access kv k v fw_changed=0 net_changed=0
+
+	config_load tailscale
+	config_get access 'settings' 'access'
+	config_get accept_dns 'settings' 'accept_dns' 1
+
+	if [ "$accept_dns" = "1" ] && [ -n "$MagicDNSSuffix" ]; then
+		local _dnsmasq_suffix="${MagicDNSSuffix#*/}"
+		uci -q del_list dhcp.dnsmasq.address="magicdns"
+		uci -q add_list dhcp.dnsmasq.address="/${_dnsmasq_suffix}/100.100.100.100" || { log "Failed to set MagicDNS suffix"; return 1; }
+	fi
+
+	# 防火墙：ACCESS 非空才建 zone（与 helper 判定一致），zone 必须绑定 network=tailscale
+	if [ -n "$access" ]; then
+		[ "$(uci -q get firewall.tszone)" = "zone" ] || { uci -q set firewall.tszone='zone'; fw_changed=1; }
+		for kv in name=tailscale network=tailscale input=ACCEPT output=ACCEPT forward=ACCEPT masq=1 mtu_fix=1; do
+			k=${kv%%=*}; v=${kv#*=}
+			[ "$(uci -q get firewall.tszone.$k)" = "$v" ] || { uci -q set firewall.tszone.$k="$v"; fw_changed=1; }
+		done
+		case " $access " in *" ts_ac_lan "*) ensure_fw_fwd ts_ac_lan tailscale lan ;; esac
+		case " $access " in *" ts_ac_wan "*) ensure_fw_fwd ts_ac_wan tailscale wan ;; esac
+		case " $access " in *" lan_ac_ts "*) ensure_fw_fwd lan_ac_ts lan tailscale ;; esac
+		case " $access " in *" wan_ac_ts "*) ensure_fw_fwd wan_ac_ts wan tailscale ;; esac
+	fi
+
+	if [ "$fw_changed" = "1" ]; then
+		uci -q commit firewall
+		/etc/init.d/firewall reload >/dev/null 2>&1 &
+	fi
+	return 0
+}
+
+# 停止时对称清理，对应上游 stop_instance，避免停用后残留空绑定的 zone
+cleanup_extras() {
+	local sec fw_changed=0 net_changed=0
+
+	config_load tailscale
+	config_get accept_dns 'settings' 'accept_dns' 1
+
+	for sec in firewall.tszone firewall.ts_ac_lan firewall.ts_ac_wan firewall.lan_ac_ts firewall.wan_ac_ts; do
+		uci -q delete "$sec" && fw_changed=1
+	done
+	uci -q delete network.tailscale && net_changed=1
+
+	if [ "$accept_dns" = "1" ]; then
+		uci -q del_list dhcp.dnsmasq.address="magicdns"
+	fi
+
+	[ "$fw_changed" = "1" ] && uci -q commit firewall
+	[ "$net_changed" = "1" ] && uci -q commit network
 	return 0
 }
 
@@ -327,6 +397,7 @@ stop_service() {
 		kill "$(cat "$pidfile")" >/dev/null 2>&1
 		rm -f "$pidfile"
 	fi
+	cleanup_extras
 	[ -x /usr/sbin/tailscaled ] && /usr/sbin/tailscaled --cleanup >/dev/null 2>&1
 	return 0
 }
@@ -362,7 +433,18 @@ TS_HOTPLUG_EOF
 	chmod 0755 "$TS_PKG_DIR/root/etc/hotplug.d/iface/40-tailscale"
 	echo "tailscale: hotplug script replaced"
 
-	# ---- 2. ACL 增量补丁：只补 logread 真实路径，其余授权保持上游原版 ----
+	# ---- 2. 删除随包安装的 tailscale_helper：init 已不再调用它，其必要功能已在 init 内复现；
+	#          留着会与 init 的 uci 写入互相打架，也可能被手工/hotplug 误调 ----
+	TS_HELPER="$TS_PKG_DIR/root/usr/sbin/tailscale_helper"
+	if [ -f "$TS_HELPER" ]; then
+		rm -f "$TS_HELPER"
+		rmdir "$TS_PKG_DIR/root/usr/sbin" 2>/dev/null
+		echo "tailscale: tailscale_helper removed"
+	else
+		echo "tailscale: tailscale_helper not found, skip"
+	fi
+
+	# ---- 3. ACL 增量补丁：只补 logread 真实路径，其余授权保持上游原版 ----
 	#   上游只授 /sbin/logread，本设备该路径为软链、真实目标 /usr/libexec/logread-ubox，
 	#   rpcd 按真实路径校验，故补该路径 read/exec 及 -e tailscale 变体，否则日志页报 ACL 拒绝
 	ACL_JSON="$TS_PKG_DIR/root/usr/share/rpcd/acl.d/luci-app-tailscale.json"
