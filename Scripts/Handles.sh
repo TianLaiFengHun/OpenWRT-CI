@@ -146,3 +146,154 @@ if [ -n "$LUCKY_MENU" ]; then
 else
 	echo "lucky menu not found; skipping!"
 fi
+
+# ======================================================================================
+# tailscale 构建侧修复：只做两件事（改写克隆下来的 luci-app-tailscale 包内容，随包安装，无需 files/ 覆盖层）
+#   1) init 只起一个 tailscaled：上游额外起的 tailscale_helper 退出码 1，触发 procd crash loop、IPv4 闪断
+#   2) ACL 只补 logread 真实路径，其余授权保持上游原版
+# tailscale 后端自带的 init/config 与 luci-app-tailscale 冲突，移除后端同名文件定义
+# ======================================================================================
+TS_BACKEND_MK=$(find ./ ../feeds/ -path "*/net/tailscale/Makefile" 2>/dev/null | head -n 1)
+if [ -n "$TS_BACKEND_MK" ]; then
+	sed -i '/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d;' "$TS_BACKEND_MK"
+	echo "tailscale backend init/config removed from Makefile"
+else
+	echo "tailscale backend Makefile not found; skipping!"
+fi
+
+TS_PKG_DIR="$PACKAGE_PATH/luci-app-tailscale"
+
+if [ -d "$TS_PKG_DIR/root" ]; then
+	# ---- 1. 替换 init 脚本：单实例 tailscaled（去掉 tailscale_helper），不额外守护接口 ----
+	mkdir -p "$TS_PKG_DIR/root/etc/init.d"
+	cat > "$TS_PKG_DIR/root/etc/init.d/tailscale" <<'TS_INIT_EOF'
+#!/bin/sh /etc/rc.common
+
+# Tailscale service（构建侧修复版）
+# 1) 单实例 tailscaled，不起 tailscale_helper（避免 procd crash loop）
+# 2) UI 选项通过 `tailscale set` 异步下发（该子命令不会触发登录）
+
+START=90
+STOP=10
+USE_PROCD=1
+
+PROGD=/usr/sbin/tailscaled
+TSCLI=/usr/sbin/tailscale
+SOCK=/var/run/tailscale/tailscaled.sock
+
+start_service() {
+	config_load tailscale
+	config_foreach start_instance tailscale
+}
+
+start_instance() {
+	local cfg="$1"
+	local enabled port config_path fw_mode log_stdout log_stderr
+
+	config_get_bool enabled "$cfg" 'enabled' 0
+	if [ "$enabled" != "1" ]; then
+		echo "tailscale: disabled in /etc/config/tailscale"
+		return 0
+	fi
+
+	config_get port "$cfg" 'port' 41641
+	config_get config_path "$cfg" 'config_path' /etc/tailscale
+	config_get_bool log_stdout "$cfg" 'log_stdout' 1
+	config_get_bool log_stderr "$cfg" 'log_stderr' 1
+
+	[ -n "$config_path" ] || config_path=/etc/tailscale
+	mkdir -p "$config_path"
+	mkdir -p /var/run/tailscale
+
+	# 纯 nftables 固件：不引入 iptables 兼容层，防火墙模式一律 nftables
+	fw_mode=nftables
+
+	/usr/sbin/tailscaled --cleanup >/dev/null 2>&1
+
+	procd_open_instance
+	procd_set_param command "$PROGD"
+	procd_append_param command --port "$port"
+	procd_append_param command --state "$config_path/tailscaled.state"
+	procd_set_param env TS_DEBUG_FIREWALL_MODE="$fw_mode"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout "$log_stdout"
+	procd_set_param stderr "$log_stderr"
+	procd_close_instance
+
+	apply_settings "$cfg" &
+}
+
+apply_settings() {
+	local cfg="$1"
+	local accept_routes accept_dns advertise_exit_node exit_node
+	local advertise_routes disable_snat authkey login_server flags hostname
+	local args="" i=0
+
+	config_get accept_routes "$cfg" 'accept_routes' 1
+	config_get accept_dns "$cfg" 'accept_dns' 1
+	config_get advertise_exit_node "$cfg" 'advertise_exit_node' 0
+	config_get exit_node "$cfg" 'exit_node'
+	config_get advertise_routes "$cfg" 'advertise_routes'
+	config_get disable_snat "$cfg" 'disable_snat_subnet_routes' 0
+	config_get authkey "$cfg" 'authkey'
+	config_get login_server "$cfg" 'login_server'
+	config_get flags "$cfg" 'flags'
+	config_get hostname "$cfg" 'hostname'
+
+	[ "$accept_routes" = "1" ] && args="$args --accept-routes=true" || args="$args --accept-routes=false"
+	[ "$accept_dns" = "0" ] && args="$args --accept-dns=false" || args="$args --accept-dns=true"
+	[ "$advertise_exit_node" = "1" ] && args="$args --advertise-exit-node=true" || args="$args --advertise-exit-node=false"
+	[ -n "$exit_node" ] && args="$args --exit-node=$exit_node --exit-node-allow-lan-access=true" || args="$args --exit-node="
+	[ -n "$advertise_routes" ] && args="$args --advertise-routes=$(echo "$advertise_routes" | tr ' ' ',')"
+	[ -n "$hostname" ] && args="$args --hostname=$hostname"
+	[ "$disable_snat" = "1" ] && args="$args --snat-subnet-routes=false" || args="$args --snat-subnet-routes=true"
+
+	while [ $i -lt 30 ]; do
+		[ -S "$SOCK" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+
+	if [ ! -S "$SOCK" ]; then
+		echo "tailscale: socket $SOCK not ready, skip applying settings"
+		return 0
+	fi
+
+	$TSCLI set $args >/dev/null 2>&1
+	[ -n "$login_server" ] && flags="$flags --login-server=$login_server"
+	[ -n "$authkey" ] && $TSCLI up --authkey="$authkey" $args $flags >/dev/null 2>&1
+	return 0
+}
+
+stop_service() {
+	[ -x /usr/sbin/tailscaled ] && /usr/sbin/tailscaled --cleanup >/dev/null 2>&1
+	return 0
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "tailscale"
+}
+TS_INIT_EOF
+	chmod 0755 "$TS_PKG_DIR/root/etc/init.d/tailscale"
+	echo "tailscale: init script replaced"
+
+
+	# ---- 2. ACL 增量补丁：只补 logread 真实路径，其余授权保持上游原版 ----
+	#   上游只授 /sbin/logread，本设备该路径为软链、真实目标 /usr/libexec/logread-ubox，
+	#   rpcd 按真实路径校验，故补该路径 read/exec 及 -e tailscale 变体，否则日志页报 ACL 拒绝
+	ACL_JSON="$TS_PKG_DIR/root/usr/share/rpcd/acl.d/luci-app-tailscale.json"
+	if [ -f "$ACL_JSON" ]; then
+		jq '.["luci-app-tailscale"].read.file = ((.["luci-app-tailscale"].read.file // {}) + {"/sbin/logread":["read","exec"],"/usr/libexec/logread-ubox":["read","exec"],"/usr/libexec/logread-ubox -e tailscale":["exec"]}) | .["luci-app-tailscale"].write.file = ((.["luci-app-tailscale"].write.file // {}) + {"/sbin/logread":["read","exec"],"/usr/libexec/logread-ubox":["read","exec"],"/usr/libexec/logread-ubox -e tailscale":["exec"]})' "$ACL_JSON" > "$ACL_JSON.tmp" && mv "$ACL_JSON.tmp" "$ACL_JSON"
+		chmod 0644 "$ACL_JSON"
+		echo "tailscale: ACL patched (logread realpath granted)"
+	else
+		echo "tailscale: ACL file not found, skip"
+	fi
+else
+	echo "tailscale: luci-app-tailscale package dir not found, skip runtime fix"
+fi
