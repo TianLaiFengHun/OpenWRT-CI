@@ -147,12 +147,12 @@ else
 	echo "lucky menu not found; skipping!"
 fi
 
-# ======================================================================================
-# tailscale 构建侧修复：只做两件事（改写克隆下来的 luci-app-tailscale 包内容，随包安装，无需 files/ 覆盖层）
+# tailscale：单实例 init + hotplug 守卫 + 接口自动建段（改写克隆下来的 luci-app-tailscale 包内容，随包安装）
 #   1) init 只起一个 tailscaled：上游额外起的 tailscale_helper 退出码 1，触发 procd crash loop、IPv4 闪断
-#   2) ACL 只补 logread 真实路径，其余授权保持上游原版
+#   2) hotplug 加 pgrep 守卫：tailscaled 拉起 tailscale0 也会 ifup，原版无条件 start 会 start→up→start 自激
+#   3) 启用后自动建 network.tailscale 段（static + 真实 IPv4/IPv6），「网络-接口」显示 tailscale0
+#   4) ACL 只补 logread 真实路径，其余授权保持上游原版
 # tailscale 后端自带的 init/config 与 luci-app-tailscale 冲突，移除后端同名文件定义
-# ======================================================================================
 TS_BACKEND_MK=$(find ./ ../feeds/ -path "*/net/tailscale/Makefile" 2>/dev/null | head -n 1)
 if [ -n "$TS_BACKEND_MK" ]; then
 	sed -i '/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d;' "$TS_BACKEND_MK"
@@ -161,10 +161,17 @@ else
 	echo "tailscale backend Makefile not found; skipping!"
 fi
 
+# ======================================================================================
+# tailscale 运行时修复：直接改写克隆下来的 luci-app-tailscale 包内容（随包安装，无需 files/ 覆盖层）
+#   1) init 只起一个 tailscaled：上游额外起的 tailscale_helper 退出码 1，触发 procd crash loop、IPv4 闪断
+#   2) hotplug 加 pgrep 守卫：tailscaled 拉起 tailscale0 也会 ifup，原版无条件 start 会 start→up→start 自激
+#   3) 启用后自动建 network.tailscale 段（static + 真实 IPv4/IPv6），「网络-接口」显示 tailscale0
+#   4) ACL 只补 logread 真实路径，其余授权保持上游原版
+# ======================================================================================
 TS_PKG_DIR="$PACKAGE_PATH/luci-app-tailscale"
 
 if [ -d "$TS_PKG_DIR/root" ]; then
-	# ---- 1. 替换 init 脚本：单实例 tailscaled（去掉 tailscale_helper），不额外守护接口 ----
+	# ---- 1. 替换 init 脚本：单实例 tailscaled（去掉 tailscale_helper）+ 异步同步 UI 选项 ----
 	mkdir -p "$TS_PKG_DIR/root/etc/init.d"
 	cat > "$TS_PKG_DIR/root/etc/init.d/tailscale" <<'TS_INIT_EOF'
 #!/bin/sh /etc/rc.common
@@ -172,6 +179,7 @@ if [ -d "$TS_PKG_DIR/root" ]; then
 # Tailscale service（构建侧修复版）
 # 1) 单实例 tailscaled，不起 tailscale_helper（避免 procd crash loop）
 # 2) UI 选项通过 `tailscale set` 异步下发（该子命令不会触发登录）
+# 3) 拿到地址后同步 network.tailscale 段，使「网络-接口」显示 tailscale0 及 IPv4/IPv6（IP 变化自动刷新）
 
 START=90
 STOP=10
@@ -221,6 +229,54 @@ start_instance() {
 	procd_close_instance
 
 	apply_settings "$cfg" &
+	ensure_netifd_iface &
+	watch_iface_changes &
+}
+
+watch_iface_changes() {
+	local pidfile=/var/run/tailscale_iface_watch.pid
+
+	(
+		while :; do
+			sleep 30
+			pgrep -f /usr/sbin/tailscaled >/dev/null 2>&1 && ensure_netifd_iface
+		done
+	) &
+	echo "$!" > "$pidfile"
+}
+
+ensure_netifd_iface() {
+	local v4 v6 i=0 changed=0
+
+	# 等 tailscaled 拿到地址（最多 60 秒）
+	while [ $i -lt 60 ]; do
+		[ -S "$SOCK" ] && [ -n "$($TSCLI ip -4 2>/dev/null)" ] && break
+		sleep 1
+		i=$((i + 1))
+	done
+	v4=$($TSCLI ip -4 2>/dev/null | head -n1)
+	v6=$($TSCLI ip -6 2>/dev/null | head -n1)
+	if [ -n "$v4" ]; then
+		case "$v4" in */*) ;; *) v4="$v4/32" ;; esac
+	fi
+	if [ -n "$v6" ]; then
+		case "$v6" in */*) ;; *) v6="$v6/128" ;; esac
+	fi
+
+	# 接口页显示：静态地址 + 真实 IPv4/IPv6，设备固定 tailscale0；值有变化才提交并 reload
+	[ "$(uci -q get network.tailscale)" = "interface" ] || { uci -q set network.tailscale='interface'; changed=1; }
+	[ "$(uci -q get network.tailscale.proto)" = "static" ] || { uci -q set network.tailscale.proto='static'; changed=1; }
+	[ "$(uci -q get network.tailscale.device)" = "tailscale0" ] || { uci -q set network.tailscale.device='tailscale0'; changed=1; }
+	if [ -n "$v4" ]; then
+		[ "$(uci -q get network.tailscale.ipaddr)" = "$v4" ] || { uci -q set network.tailscale.ipaddr="$v4"; changed=1; }
+	fi
+	if [ -n "$v6" ]; then
+		[ "$(uci -q get network.tailscale.ip6addr)" = "$v6" ] || { uci -q set network.tailscale.ip6addr="$v6"; changed=1; }
+	fi
+	[ "$changed" = "1" ] || return 0
+	uci -q commit network
+	/etc/init.d/network reload >/dev/null 2>&1 &
+	return 0
 }
 
 apply_settings() {
@@ -266,6 +322,11 @@ apply_settings() {
 }
 
 stop_service() {
+	local pidfile=/var/run/tailscale_iface_watch.pid
+	if [ -s "$pidfile" ]; then
+		kill "$(cat "$pidfile")" >/dev/null 2>&1
+		rm -f "$pidfile"
+	fi
 	[ -x /usr/sbin/tailscaled ] && /usr/sbin/tailscaled --cleanup >/dev/null 2>&1
 	return 0
 }
@@ -282,6 +343,24 @@ TS_INIT_EOF
 	chmod 0755 "$TS_PKG_DIR/root/etc/init.d/tailscale"
 	echo "tailscale: init script replaced"
 
+	# ---- 1.1 替换 hotplug 脚本：原版在任意接口 ifup/ifupdate 时都执行 start，
+	#          与 tailscaled 自己拉起 tailscale0 的事件互相触发，形成 start->up->start 循环 ----
+	mkdir -p "$TS_PKG_DIR/root/etc/hotplug.d/iface"
+	cat > "$TS_PKG_DIR/root/etc/hotplug.d/iface/40-tailscale" <<'TS_HOTPLUG_EOF'
+#!/bin/sh
+
+# 接口上线时确保 tailscaled 在跑：
+# 1) 进程已在运行则直接退出——tailscaled 拉起 tailscale0 本身也会产生 ifup 事件，
+#    原版无条件 start 会形成 start→up→start 自激重启并导致 IPv4 闪断
+# 2) 不限定接口名，避免 WAN 被改成 pppoe-wan 等名称后服务永不启动
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$(uci -q get tailscale.settings.enabled)" = "1" ] || exit 0
+pgrep -f /usr/sbin/tailscaled >/dev/null 2>&1 && exit 0
+/etc/init.d/tailscale start >/tmp/tailscale.log 2>&1 &
+TS_HOTPLUG_EOF
+	chmod 0755 "$TS_PKG_DIR/root/etc/hotplug.d/iface/40-tailscale"
+	echo "tailscale: hotplug script replaced"
 
 	# ---- 2. ACL 增量补丁：只补 logread 真实路径，其余授权保持上游原版 ----
 	#   上游只授 /sbin/logread，本设备该路径为软链、真实目标 /usr/libexec/logread-ubox，
