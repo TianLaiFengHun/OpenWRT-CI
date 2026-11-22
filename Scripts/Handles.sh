@@ -148,7 +148,16 @@ else
 fi
 
 # ======================================================================================
-# tailscale：构建侧仅做 ACL 增量补丁（logread 真实路径），其余行为保持上游 luci-app-tailscale 原版
+# tailscale：按 asvow/luci-app-tailscale 官方要求，删除官方后端 Makefile 中安装
+#   /etc/init.d/tailscale 与 /etc/config/tailscale 的两行，改由 luci-app-tailscale 统一提供，
+#   否则 package/install 阶段报 trying to overwrite ... owned by tailscale-xxx
+# ======================================================================================
+FIX "tailscale-conflict" "$FEEDS_PATH/packages/net/tailscale" sed -i \
+	'/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d;' \
+	"$FEEDS_PATH/packages/net/tailscale/Makefile"
+
+# ======================================================================================
+# tailscale：ACL 增量补丁（logread 真实路径），其余行为保持上游 luci-app-tailscale 原版
 #   上游只授 /sbin/logread，本设备该路径为软链、真实目标 /usr/libexec/logread-ubox，
 #   rpcd 按真实路径校验，故补该路径 read/exec 及 -e tailscale 变体，否则日志页报 ACL 拒绝
 # ======================================================================================
