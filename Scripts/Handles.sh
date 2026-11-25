@@ -147,12 +147,10 @@ else
 	echo "lucky menu not found; skipping!"
 fi
 
-# tailscale：保留 helper + 接口地址交还 tailscaled（改写克隆下来的 luci-app-tailscale 包内容，随包安装）
-#   1) helper 完整保留（连接、MagicDNS、子网路由、防火墙 zone），只去掉它写接口地址的部分
-#   2) network.tailscale 改 proto=none：地址与 100.64.0.0/10 路由由 tailscaled 自己配，避免 netifd 先配后被跳过
-#   3) LuCI「网络-接口」仍显示 tailscale0，界面只作显示，不参与配置
-#   4) ACL 只补 logread 真实路径，其余授权保持上游原版
-# tailscale 后端自带的 init/config 与 luci-app-tailscale 冲突，移除后端同名文件定义
+# tailscale：只做两处改动（官方要求 + ACL 日志修复），其余保持上游原版
+#   1) 官方要求：后端 Makefile 不装 /etc/init.d/tailscale 与 /etc/config/tailscale（改用 luci 版）
+#   2) ACL 只补 logread 真实路径，其余授权保持上游原版
+#   注：helper 的 proto=none 由上游代码自身在非单播分支写入，此处不再 sed 覆盖
 TS_BACKEND_MK=$(find ./ ../feeds/ -path "*/net/tailscale/Makefile" 2>/dev/null | head -n 1)
 if [ -n "$TS_BACKEND_MK" ]; then
 	sed -i '/\/etc\/init\.d\/tailscale/d;/\/etc\/config\/tailscale/d;' "$TS_BACKEND_MK"
@@ -162,38 +160,12 @@ else
 fi
 
 # ======================================================================================
-# tailscale 运行时修复：直接改写克隆下来的 luci-app-tailscale 包内容（随包安装，无需 files/ 覆盖层）
-#   1) 保留 tailscale_helper（连接、MagicDNS、子网路由、防火墙 zone 等逻辑一行不动）
-#   2) 只把 helper 写 network.tailscale 的地址部分去掉：proto 改 none、不写 ipaddr/ip6addr/netmask
-#      原因：tailscaled 1.104 重构后「先检查再动手」，netifd 已配的地址会让它跳过整个接口配置，
-#            导致 100.64.0.0/10 路由不装；地址交给 tailscaled 自己配才完整
-#   3) 「网络-接口」仍显示 tailscale0（内核地址可读），配置段保留但 netifd 不再 apply
-#   4) ACL 只补 logread 真实路径，其余授权保持上游原版
+# tailscale 运行时修复：只补 ACL 日志授权一处，其余保持上游原版
 # ======================================================================================
 TS_PKG_DIR="$PACKAGE_PATH/luci-app-tailscale"
 
 if [ -d "$TS_PKG_DIR/root" ]; then
-	# ---- 1. helper：接口地址交还 tailscaled ----
-	TS_HELPER="$TS_PKG_DIR/root/usr/sbin/tailscale_helper"
-	if [ -f "$TS_HELPER" ]; then
-		sed -i \
-			-e "s/\(network\.tailscale\.proto=\)'static'/\1none/" \
-			-e "s/\(network\.tailscale\.proto=\)\"static\"/\1none/" \
-			-e "s/\(network\.tailscale\.proto=\)static/\1none/" \
-			-e "/network\.tailscale\.ipaddr=/d" \
-			-e "/network\.tailscale\.ip6addr=/d" \
-			-e "/network\.tailscale\.netmask=/d" \
-			"$TS_HELPER"
-		if grep -q "proto=none" "$TS_HELPER"; then
-			echo "tailscale: helper patched (interface addr owned by tailscaled)"
-		else
-			echo "tailscale: WARN helper proto not patched, check helper source!"
-		fi
-	else
-		echo "tailscale: tailscale_helper not found, skip"
-	fi
-
-	# ---- 2. ACL 增量补丁：只补 logread 真实路径，其余授权保持上游原版 ----
+	# ---- 1. ACL 增量补丁：只补 logread 真实路径，其余授权保持上游原版 ----
 	#   上游只授 /sbin/logread，本设备该路径为软链、真实目标 /usr/libexec/logread-ubox，
 	#   rpcd 按真实路径校验，故补该路径 read/exec 及 -e tailscale 变体，否则日志页报 ACL 拒绝
 	ACL_JSON="$TS_PKG_DIR/root/usr/share/rpcd/acl.d/luci-app-tailscale.json"
