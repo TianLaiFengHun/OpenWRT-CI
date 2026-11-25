@@ -179,3 +179,22 @@ if [ -d "$TS_PKG_DIR/root" ]; then
 else
 	echo "tailscale: luci-app-tailscale package dir not found, skip runtime fix"
 fi
+
+# ======================================================================================
+# tailscale 运行时修复 2：init 的 reload 去掉 stop（修上游竞态）
+# ======================================================================================
+# 上游 reload_service() 为 { stop; start; }，而 stop_instance 会 uci delete network.tailscale
+# 并调用 tailscaled --cleanup 删除 tailscale0 上的地址；wan 链路 up 触发 interface trigger → reload
+# 之后 netifd 认为接口段已移除、不再下发 static 地址，内核里 100.66.6.1 丢失且无人补回
+# （现象：接口页显示地址、插件页为空、其它设备连 100.66.6.1 不通）。
+# 改为只 start，stop 语义不变（手动 stop 仍走完整清理）。
+TS_INIT=$(find ./ ../feeds/ -path "*/luci-app-tailscale/root/etc/init.d/tailscale" 2>/dev/null | head -n 1)
+if [ -n "$TS_INIT" ]; then
+	sed -i \
+		-e '/^reload_service()/,/^}/{/^[[:space:]]*stop[[:space:]]*$/d}' \
+		-e 's/^reload_service()[[:space:]]*{[[:space:]]*stop[[:space:]]*;[[:space:]]*start[[:space:]]*;[[:space:]]*}/reload_service() { start; }/' \
+		"$TS_INIT"
+	echo "tailscale: reload_service patched (start only, no stop)"
+else
+	echo "tailscale: init script not found; skipping!"
+fi
