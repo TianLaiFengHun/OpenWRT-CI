@@ -181,20 +181,39 @@ else
 fi
 
 # ======================================================================================
-# tailscale 运行时修复 2：init 的 reload 去掉 stop（修上游竞态）
+# tailscale 运行时修复 2：init 的 reload 改为「只重启进程」
 # ======================================================================================
-# 上游 reload_service() 为 { stop; start; }，而 stop_instance 会 uci delete network.tailscale
-# 并调用 tailscaled --cleanup 删除 tailscale0 上的地址；wan 链路 up 触发 interface trigger → reload
-# 之后 netifd 认为接口段已移除、不再下发 static 地址，内核里 100.66.6.1 丢失且无人补回
-# （现象：接口页显示地址、插件页为空、其它设备连 100.66.6.1 不通）。
-# 改为只 start，stop 语义不变（手动 stop 仍走完整清理）。
+# 上游：reload_service() { stop; start; }，其中 stop → stop_instance 会做三件破坏性动作：
+#   1) uci delete network.tailscale → 接口段没了，netifd 之后不再下发 static 地址
+#   2) /usr/sbin/tailscaled --cleanup → 清掉 tailscale0 上的地址
+#   3) rm -rf $CONFIG_PATH → 删 state（节点身份重置）
+# wan 链路 up 会经 procd interface trigger 触发 reload，于是每次拨号都丢地址、对端连不上。
+# 但 reload 只写 start 也不行：procd 下实例已在运行，start 是 no-op，wan 换 IP 后 tailscaled
+# 不重启、新端点不推给对端（现象：本机有地址，其它设备连不上，手动 restart 才恢复）。
+# 正解：reload 只重启进程，绕过 stop_instance 的三项清理，由 procd respawn 自动拉起。
+# 注：pgrep 用 "tailscaled --port" 精确匹配主实例，不会误杀 start 阶段的 tailscaled --cleanup。
 TS_INIT=$(find ./ ../feeds/ -path "*/luci-app-tailscale/root/etc/init.d/tailscale" 2>/dev/null | head -n 1)
 if [ -n "$TS_INIT" ]; then
-	sed -i \
-		-e '/^reload_service()/,/^}/{/^[[:space:]]*stop[[:space:]]*$/d}' \
-		-e 's/^reload_service()[[:space:]]*{[[:space:]]*stop[[:space:]]*;[[:space:]]*start[[:space:]]*;[[:space:]]*}/reload_service() { start; }/' \
-		"$TS_INIT"
-	echo "tailscale: reload_service patched (start only, no stop)"
+	awk '
+	/^reload_service\(\)/ {
+		if ($0 ~ /}/) {
+			print "reload_service() {"
+			print "\tprocd_send_signal tailscale 2>/dev/null || kill $(pgrep -f \"tailscaled --port\" | head -n 1) 2>/dev/null"
+			print "}"
+			next
+		}
+		inblock = 1
+		print
+		print "\t# 只重启进程：不删 network.tailscale、不 --cleanup、不删 state"
+		print "\tprocd_send_signal tailscale 2>/dev/null || kill $(pgrep -f \"tailscaled --port\" | head -n 1) 2>/dev/null"
+		next
+	}
+	inblock && /^}/ { inblock = 0; print; next }
+	inblock { next }
+	{ print }
+	' "$TS_INIT" > "$TS_INIT.patched" && mv "$TS_INIT.patched" "$TS_INIT"
+	chmod 0755 "$TS_INIT"
+	echo "tailscale: reload_service patched (restart process only, no stop_instance)"
 else
 	echo "tailscale: init script not found; skipping!"
 fi
