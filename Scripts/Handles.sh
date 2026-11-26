@@ -181,9 +181,10 @@ else
 fi
 
 # ======================================================================================
-# tailscale 运行时修复 2：start 后补齐 tailscale0 地址（reload 保持官方原版）
+# tailscale 运行时修复 2：start 后补齐 tailscale0 双栈地址（reload 保持官方原版）
 # ======================================================================================
-# 现象：刷机后 tailscale0 上没有 IPv4（插件页为空、局域网其它设备连 100.66.6.1 不通），
+# 现象：刷机后 tailscale0 上既没有 IPv4 也没有全局 IPv6（只剩 fe80 链路本地），
+#       插件页（读 tailscaled 状态）显示双栈正常、系统接口页（读内核/netifd）却是空的，两处对不上；
 #       重启服务也补不回来。
 # 根因（tailscaled v1.104.6 日志实证）：
 #   router: removed 2 stale Tailscale address(es) from tailscale0 left by a previous instance:
@@ -192,7 +193,8 @@ fi
 #   但 tailscaled 每次进程启动都会把链路上 CGNAT 段的地址一律当成「上一实例残留」清掉，
 #   清完自己不补，netifd 又只在 ifup 时下发一次，于是接口长期没有地址。
 # 处理：不改编 reload 语义（保持官方 stop+start），只在 start_instance 拉起 tailscaled 后异步
-#   等它就绪，按 uci 里的 ipaddr/netmask 原值补回（保持 /8 语义与 100.0.0.0/8 直连路由）。
+#   等它就绪，按 uci 里的 ipaddr/netmask/ip6addr 原值把双栈补回（v4 保持 /8 语义与 100.0.0.0/8 直连路由，
+#   v6 按上游节点的 /128 补）。
 TS_INIT=$(find ./ ../feeds/ -path "*/luci-app-tailscale/root/etc/init.d/tailscale" 2>/dev/null | head -n 1)
 if [ -n "$TS_INIT" ]; then
 	if grep -q 'TS_ADDR_GUARD' "$TS_INIT"; then
@@ -208,11 +210,16 @@ if [ -n "$TS_INIT" ]; then
 			print "\t\twhile [ $i -lt 60 ]; do /usr/sbin/tailscale ip -4 >/dev/null 2>&1 && break; i=$((i+1)); sleep 1; done"
 			print "\t\tsleep 2"
 			print "\t\ta=$(uci -q get network.tailscale.ipaddr); m=$(uci -q get network.tailscale.netmask)"
+			print "\t\ta6=$(uci -q get network.tailscale.ip6addr)"
 			print "\t\t[ -n \"$a\" ] || a=$(/usr/sbin/tailscale ip -4 2>/dev/null | head -n1)"
+			print "\t\t[ -n \"$a6\" ] || a6=$(/usr/sbin/tailscale ip -6 2>/dev/null | head -n1)"
 			print "\t\t[ -n \"$m\" ] || m=255.0.0.0"
-			print "\t\t[ -n \"$a\" ] || exit 0"
-			print "\t\tip -4 addr show dev tailscale0 2>/dev/null | grep -q \"inet $a/\" && exit 0"
-			print "\t\tip addr add \"$a/$m\" dev tailscale0 2>/dev/null || ip addr add \"$a/8\" dev tailscale0"
+			print "\t\tif [ -n \"$a\" ] && ! ip -4 addr show dev tailscale0 2>/dev/null | grep -q \"inet $a/\"; then"
+			print "\t\t\tip addr add \"$a/$m\" dev tailscale0 2>/dev/null || ip addr add \"$a/8\" dev tailscale0"
+			print "\t\tfi"
+			print "\t\tif [ -n \"$a6\" ] && ! ip -6 addr show dev tailscale0 2>/dev/null | grep -q \"inet6 $a6/\"; then"
+			print "\t\t\tip -6 addr add \"$a6/128\" dev tailscale0"
+			print "\t\tfi"
 			print "\t) &"
 		}
 		' "$TS_INIT" > "$TS_INIT.patched" && mv "$TS_INIT.patched" "$TS_INIT"
