@@ -181,39 +181,48 @@ else
 fi
 
 # ======================================================================================
-# tailscale 运行时修复 2：init 的 reload 改为「只重启进程」
+# tailscale 运行时修复 2：start 后补齐 tailscale0 地址（reload 保持官方原版）
 # ======================================================================================
-# 上游：reload_service() { stop; start; }，其中 stop → stop_instance 会做三件破坏性动作：
-#   1) uci delete network.tailscale → 接口段没了，netifd 之后不再下发 static 地址
-#   2) /usr/sbin/tailscaled --cleanup → 清掉 tailscale0 上的地址
-#   3) rm -rf $CONFIG_PATH → 删 state（节点身份重置）
-# wan 链路 up 会经 procd interface trigger 触发 reload，于是每次拨号都丢地址、对端连不上。
-# 但 reload 只写 start 也不行：procd 下实例已在运行，start 是 no-op，wan 换 IP 后 tailscaled
-# 不重启、新端点不推给对端（现象：本机有地址，其它设备连不上，手动 restart 才恢复）。
-# 正解：reload 只重启进程，绕过 stop_instance 的三项清理，由 procd respawn 自动拉起。
-# 注：pgrep 用 "tailscaled --port" 精确匹配主实例，不会误杀 start 阶段的 tailscaled --cleanup。
+# 现象：刷机后 tailscale0 上没有 IPv4（插件页为空、局域网其它设备连 100.66.6.1 不通），
+#       重启服务也补不回来。
+# 根因（tailscaled v1.104.6 日志实证）：
+#   router: removed 2 stale Tailscale address(es) from tailscale0 left by a previous instance:
+#           [100.66.6.1/8 fd7a:115c:a1e0::f82f:7380/128]
+#   官方设计就是 proto=static + netmask 255.0.0.0（100.66.6.1/8），前缀长度本身没有问题；
+#   但 tailscaled 每次进程启动都会把链路上 CGNAT 段的地址一律当成「上一实例残留」清掉，
+#   清完自己不补，netifd 又只在 ifup 时下发一次，于是接口长期没有地址。
+# 处理：不改编 reload 语义（保持官方 stop+start），只在 start_instance 拉起 tailscaled 后异步
+#   等它就绪，按 uci 里的 ipaddr/netmask 原值补回（保持 /8 语义与 100.0.0.0/8 直连路由）。
 TS_INIT=$(find ./ ../feeds/ -path "*/luci-app-tailscale/root/etc/init.d/tailscale" 2>/dev/null | head -n 1)
 if [ -n "$TS_INIT" ]; then
-	awk '
-	/^reload_service\(\)/ {
-		if ($0 ~ /}/) {
-			print "reload_service() {"
-			print "\tprocd_send_signal tailscale 2>/dev/null || kill $(pgrep -f \"tailscaled --port\" | head -n 1) 2>/dev/null"
-			print "}"
-			next
+	if grep -q 'TS_ADDR_GUARD' "$TS_INIT"; then
+		echo "tailscale: address guard already present, skip"
+	else
+		awk '
+		{ print }
+		/^[[:space:]]*tailscale_helper / {
+			print ""
+			print "\t# TS_ADDR_GUARD: netifd 下发的地址会被 tailscaled 启动时的 stale cleanup 清掉，等它就绪后按 uci 原值补回"
+			print "\t("
+			print "\t\ti=0"
+			print "\t\twhile [ $i -lt 60 ]; do /usr/sbin/tailscale ip -4 >/dev/null 2>&1 && break; i=$((i+1)); sleep 1; done"
+			print "\t\tsleep 2"
+			print "\t\ta=$(uci -q get network.tailscale.ipaddr); m=$(uci -q get network.tailscale.netmask)"
+			print "\t\t[ -n \"$a\" ] || a=$(/usr/sbin/tailscale ip -4 2>/dev/null | head -n1)"
+			print "\t\t[ -n \"$m\" ] || m=255.0.0.0"
+			print "\t\t[ -n \"$a\" ] || exit 0"
+			print "\t\tip -4 addr show dev tailscale0 2>/dev/null | grep -q \"inet $a/\" && exit 0"
+			print "\t\tip addr add \"$a/$m\" dev tailscale0 2>/dev/null || ip addr add \"$a/8\" dev tailscale0"
+			print "\t) &"
 		}
-		inblock = 1
-		print
-		print "\t# 只重启进程：不删 network.tailscale、不 --cleanup、不删 state"
-		print "\tprocd_send_signal tailscale 2>/dev/null || kill $(pgrep -f \"tailscaled --port\" | head -n 1) 2>/dev/null"
-		next
-	}
-	inblock && /^}/ { inblock = 0; print; next }
-	inblock { next }
-	{ print }
-	' "$TS_INIT" > "$TS_INIT.patched" && mv "$TS_INIT.patched" "$TS_INIT"
-	chmod 0755 "$TS_INIT"
-	echo "tailscale: reload_service patched (restart process only, no stop_instance)"
+		' "$TS_INIT" > "$TS_INIT.patched" && mv "$TS_INIT.patched" "$TS_INIT"
+		chmod 0755 "$TS_INIT"
+		if grep -q 'TS_ADDR_GUARD' "$TS_INIT"; then
+			echo "tailscale: address guard added after tailscale_helper"
+		else
+			echo "tailscale: WARN address guard not inserted (tailscale_helper missing)"
+		fi
+	fi
 else
 	echo "tailscale: init script not found; skipping!"
 fi
